@@ -1,0 +1,18 @@
+[project]
+name = "collab-playlist-voting"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Wolfgang Rahfeldt",email = "wolfrahfeldt@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit (>=1.53.1,<2.0.0)",
+    "spotipy (>=2.25.2,<3.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
