@@ -10,6 +10,7 @@ import re
 # --- Configuration ---
 TRACKS_FILE = 'tracks.json'
 VOTES_FILE = 'votes.json'
+HISTORY_FILE = 'history.json'
 PAGE_SIZE = 10  # Number of tracks per page
 
 # --- Data Persistence ---
@@ -172,6 +173,21 @@ def main():
     # Load Data
     all_votes = load_json(VOTES_FILE, {})
     snapshot_tracks = load_json(TRACKS_FILE, [])
+    history = load_json(HISTORY_FILE, [])
+
+    # --- Calculations ---
+    # Calculate vote counts for display and pruning
+    vote_counts = {}
+    for user, user_votes in all_votes.items():
+        for tid in user_votes:
+            vote_counts[tid] = vote_counts.get(tid, 0) + 1
+            
+    # Attach votes to track objects for sorting (creates a temporary list)
+    tracks_with_votes = []
+    for t in snapshot_tracks:
+        t_copy = t.copy()
+        t_copy['votes'] = vote_counts.get(t['id'], 0)
+        tracks_with_votes.append(t_copy)
 
     # --- Sidebar: Auth & Admin ---
     with st.sidebar:
@@ -183,88 +199,161 @@ def main():
         with st.expander("Admin Tools"):
             admin_password = st.text_input("Admin Password", type="password")
             if admin_password == "admin123":  # Replace with env var in production
-                st.write("**Start New Round**")
-                st.caption("Paste a Spotify Playlist URL OR a list of song links (if API is down).")
-                new_playlist_input = st.text_area("Input Data")
+                st.write("### 1. New Round (Import)")
+                st.caption("Start from scratch with a new playlist.")
+                new_playlist_input = st.text_area("Playlist URL / Links")
                 
-                if st.button("Fetch Tracks & Start Round"):
+                if st.button("Fetch Tracks & Reset"):
                     if new_playlist_input:
                         with st.spinner("Processing..."):
                             try:
+                                # Archive if data exists
+                                if snapshot_tracks:
+                                    history.append({
+                                        "round": len(history) + 1,
+                                        "tracks": snapshot_tracks,
+                                        "votes": all_votes,
+                                        "final_counts": vote_counts
+                                    })
+                                    save_json(HISTORY_FILE, history)
+
                                 data = fetch_playlist_snapshot(new_playlist_input)
                                 save_json(TRACKS_FILE, data)
+                                save_json(VOTES_FILE, {}) # Reset votes for new tracks
                                 st.success(f"Snapshot saved! {len(data)} tracks loaded.")
-                                # Reset pagination
                                 st.session_state['page'] = 0
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Error: {e}")
-                
+
                 st.markdown("---")
-                if st.button("Show Current Results"):
-                    st.write("**Current Votes:**")
-                    st.json(all_votes)
+                st.write("### 2. Next Round (Prune)")
+                st.caption("Keep Top N tracks and reset votes.")
+                
+                # Sort for pruning logic
+                sorted_by_votes = sorted(tracks_with_votes, key=lambda x: x['votes'], reverse=True)
+                max_val = len(snapshot_tracks) if snapshot_tracks else 1
+                top_n = st.number_input("Keep Top N", min_value=1, max_value=max_val, value=min(10, max_val))
+                
+                if st.button("Prune & Advance"):
+                    if snapshot_tracks:
+                        # 1. Archive current state
+                        history.append({
+                            "round": len(history) + 1,
+                            "tracks": snapshot_tracks,
+                            "votes": all_votes,
+                            "final_counts": vote_counts
+                        })
+                        save_json(HISTORY_FILE, history)
+                        
+                        # 2. Slice top N tracks (clean metadata only)
+                        keep_ids = {t['id'] for t in sorted_by_votes[:top_n]}
+                        next_round_tracks = [t for t in snapshot_tracks if t['id'] in keep_ids]
+                        
+                        # 3. Save and Reset
+                        save_json(TRACKS_FILE, next_round_tracks)
+                        save_json(VOTES_FILE, {}) # Clear votes for the next round
+                        st.success(f"Advanced to next round with top {len(next_round_tracks)} tracks!")
+                        st.session_state['page'] = 0
+                        st.rerun()
 
     # --- Main Logic ---
     if not username:
         st.info("👈 Please enter your name in the sidebar to start voting.")
         return
 
-    if not snapshot_tracks:
-        st.warning("No voting round is currently active. Ask an admin to start a round.")
-        return
+    # Tabs for separation of concerns
+    tab_vote, tab_results = st.tabs(["🗳️ Vote & Listen", "📊 Results"])
 
-    # Load existing votes for user if first load of session
-    if username in all_votes and 'loaded_user' not in st.session_state:
-        st.session_state['votes'] = set(all_votes[username])
-        st.session_state['loaded_user'] = username
-        st.toast(f"Loaded {len(st.session_state['votes'])} previous votes.")
-    elif 'loaded_user' not in st.session_state:
-        st.session_state['loaded_user'] = username
+    # --- TAB 1: Voting ---
+    with tab_vote:
+        if not snapshot_tracks:
+            st.warning("No voting round is currently active. Ask an admin to start a round.")
+        else:
+            # Load existing votes for user if first load of session
+            if username in all_votes and 'loaded_user' not in st.session_state:
+                st.session_state['votes'] = set(all_votes[username])
+                st.session_state['loaded_user'] = username
+                st.toast(f"Loaded {len(st.session_state['votes'])} previous votes.")
+            elif 'loaded_user' not in st.session_state:
+                st.session_state['loaded_user'] = username
 
-    # Handle User Switching
-    if st.session_state['loaded_user'] != username:
-        st.session_state['votes'] = set(all_votes.get(username, []))
-        st.session_state['loaded_user'] = username
-        st.rerun()
+            # Handle User Switching
+            if st.session_state['loaded_user'] != username:
+                st.session_state['votes'] = set(all_votes.get(username, []))
+                st.session_state['loaded_user'] = username
+                st.rerun()
 
-    # --- Pagination ---
-    total_tracks = len(snapshot_tracks)
-    total_pages = math.ceil(total_tracks / PAGE_SIZE)
-    
-    col_prev, col_info, col_next = st.columns([1, 10, 1])
-    
-    with col_prev:
-        if st.button("Previous") and st.session_state['page'] > 0:
-            st.session_state['page'] -= 1
-            st.rerun()
+            # --- Pagination ---
+            total_tracks = len(snapshot_tracks)
+            total_pages = math.ceil(total_tracks / PAGE_SIZE)
             
-    with col_next:
-        if st.button("Next") and st.session_state['page'] < total_pages - 1:
-            st.session_state['page'] += 1
-            st.rerun()
+            # Top Controls
+            c_info, c_save = st.columns([6, 2])
+            with c_info:
+                st.caption(f"Page {st.session_state['page'] + 1} of {total_pages} | Total Tracks: {total_tracks}")
+            with c_save:
+                if st.button("💾 Save Votes", type="primary", key="save_top"):
+                    all_votes[username] = list(st.session_state['votes'])
+                    save_json(VOTES_FILE, all_votes)
+                    st.toast("Votes saved!")
             
-    with col_info:
-        st.caption(f"Page {st.session_state['page'] + 1} of {total_pages} | Total Tracks: {total_tracks}")
+            # Render List
+            start_idx = st.session_state['page'] * PAGE_SIZE
+            end_idx = start_idx + PAGE_SIZE
+            current_batch = snapshot_tracks[start_idx:end_idx]
+            
+            for track in current_batch:
+                render_track_row(track)
 
-    # --- Render List ---
-    current_page = st.session_state['page']
-    start_idx = current_page * PAGE_SIZE
-    end_idx = start_idx + PAGE_SIZE
-    current_batch = snapshot_tracks[start_idx:end_idx]
-    
-    for track in current_batch:
-        render_track_row(track)
+            # Bottom Pagination Controls
+            st.markdown("---")
+            col_prev, col_spacer, col_next = st.columns([1, 8, 1])
+            
+            with col_prev:
+                if st.button("◀ Previous") and st.session_state['page'] > 0:
+                    st.session_state['page'] -= 1
+                    st.rerun()
+                    
+            with col_next:
+                if st.button("Next ▶") and st.session_state['page'] < total_pages - 1:
+                    st.session_state['page'] += 1
+                    st.rerun()
 
-    # --- Submission ---
-    st.markdown("---")
-    st.write(f"### You have selected {len(st.session_state['votes'])} tracks to keep.")
-    
-    if st.button("Submit / Update Votes", type="primary"):
-        all_votes[username] = list(st.session_state['votes'])
-        save_json(VOTES_FILE, all_votes)
-        st.balloons()
-        st.success("✅ Votes saved successfully! You can close this tab or update votes later.")
-
+    # --- TAB 2: Results ---
+    with tab_results:
+        st.header("Current Round Standings")
+        if not snapshot_tracks:
+            st.info("No active round.")
+        else:
+            # Sort tracks by votes descending
+            sorted_tracks = sorted(tracks_with_votes, key=lambda x: x['votes'], reverse=True)
+            total_voters = len(all_votes) if all_votes else 1 # avoid div/0
+            
+            for t in sorted_tracks:
+                col_meta, col_bar = st.columns([2, 3])
+                with col_meta:
+                    st.write(f"**{t['name']}**")
+                    st.caption(t['artist'])
+                with col_bar:
+                    vote_count = t['votes']
+                    pct = vote_count / total_voters
+                    st.progress(pct)
+                    st.caption(f"{vote_count} votes ({int(pct*100)}%)")
+                st.markdown("---")
+        
+        if history:
+            st.header("📜 History")
+            st.markdown("---")
+            for record in reversed(history):
+                with st.expander(f"Round {record['round']} Results ({len(record['tracks'])} tracks)"):
+                    h_counts = record.get('final_counts', {})
+                    h_tracks = record['tracks']
+                    # Sort by historical counts
+                    h_sorted = sorted(h_tracks, key=lambda x: h_counts.get(x['id'], 0), reverse=True)
+                    
+                    for t in h_sorted:
+                        vc = h_counts.get(t['id'], 0)
+                        st.write(f"**{vc}** - {t['name']} - _{t['artist']}_")
 if __name__ == "__main__":
     main()
