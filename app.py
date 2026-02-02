@@ -21,9 +21,21 @@ def get_db():
             from google.cloud import firestore
             from google.oauth2 import service_account
             
-            # Load credentials from secrets
-            # strict=False allows control characters (newlines) in the JSON string
-            key_dict = json.loads(st.secrets["firestore"]["textkey"], strict=False)
+            # Load credentials
+            # Strategy 1: Support exploded TOML keys (Preferred for Streamlit Cloud)
+            # This avoids JSON parsing errors inside the TOML file.
+            if "project_id" in st.secrets["firestore"]:
+                key_dict = dict(st.secrets["firestore"])
+                # Fix common issue where private_key has escaped newlines
+                if "private_key" in key_dict:
+                    key_dict["private_key"] = key_dict["private_key"].replace("\\n", "\n")
+            
+            # Strategy 2: Support raw JSON string (Legacy/Local)
+            elif "textkey" in st.secrets["firestore"]:
+                key_dict = json.loads(st.secrets["firestore"]["textkey"], strict=False)
+            else:
+                return None
+
             creds = service_account.Credentials.from_service_account_info(key_dict)
             return firestore.Client(credentials=creds)
         except Exception as e:
