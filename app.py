@@ -14,16 +14,63 @@ HISTORY_FILE = 'history.json'
 PAGE_SIZE = 10  # Number of tracks per page
 
 # --- Data Persistence ---
+def get_db():
+    """Initialize Firestore client if secrets are available."""
+    if "firestore" in st.secrets:
+        try:
+            from google.cloud import firestore
+            from google.oauth2 import service_account
+            
+            # Load credentials from secrets
+            # strict=False allows control characters (newlines) in the JSON string
+            key_dict = json.loads(st.secrets["firestore"]["textkey"], strict=False)
+            creds = service_account.Credentials.from_service_account_info(key_dict)
+            return firestore.Client(credentials=creds)
+        except Exception as e:
+            st.error(f"Firestore Connection Error: {e}")
+    return None
+
 def load_json(filepath, default_value):
-    if not os.path.exists(filepath):
-        return default_value
-    try:
-        with open(filepath, 'r') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return default_value
+    """Load data from Firestore (if configured) or local JSON."""
+    data = None
+    
+    # 1. Try Firestore
+    db = get_db()
+    if db:
+        try:
+            doc_id = os.path.splitext(filepath)[0]  # e.g., 'tracks.json' -> 'tracks'
+            doc = db.collection("playlist_voting").document(doc_id).get()
+            if doc.exists:
+                data = doc.to_dict().get("data")
+        except Exception as e:
+            st.warning(f"Firestore read error: {e}. Falling back to local file.")
+
+    # 2. Fallback to Local File (if Firestore is missing the doc or returned None)
+    # This ensures the static 'tracks.json' is used as the seed when the DB is empty.
+    if data is None:
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, 'r') as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+                
+    return data if data is not None else default_value
 
 def save_json(filepath, data):
+    """Save data to Firestore (if configured) or local JSON."""
+    # 1. Try Firestore
+    db = get_db()
+    if db:
+        try:
+            doc_id = os.path.splitext(filepath)[0]
+            db.collection("playlist_voting").document(doc_id).set({"data": data})
+            return
+        except Exception as e:
+            st.error(f"Firestore save error: {e}")
+            # Fall through to local save as backup
+
+    # 2. Fallback to Local File
     with open(filepath, 'w') as f:
         json.dump(data, f, indent=2)
 
@@ -106,7 +153,7 @@ def fetch_playlist_snapshot(input_text):
     return snapshot
 
 # --- UI Components ---
-def render_track_row(track):
+def render_track_row(track, on_vote_change=None):
     # Layout: Text (3) | Player (4) | Checkbox (1)
     c1, c2, c3 = st.columns([3, 4, 1])
     
@@ -148,6 +195,10 @@ def render_track_row(track):
                 st.session_state['votes'].add(track['id'])
             else:
                 st.session_state['votes'].discard(track['id'])
+            
+            # Trigger auto-save if callback provided
+            if on_vote_change:
+                on_vote_change()
         
         # Spacer to align checkbox with the taller player
         st.write("")
@@ -167,8 +218,6 @@ def main():
     # Initialize Session State
     if 'votes' not in st.session_state:
         st.session_state['votes'] = set()
-    if 'page' not in st.session_state:
-        st.session_state['page'] = 0
     
     # Load Data
     all_votes = load_json(VOTES_FILE, {})
@@ -221,7 +270,6 @@ def main():
                                 save_json(TRACKS_FILE, data)
                                 save_json(VOTES_FILE, {}) # Reset votes for new tracks
                                 st.success(f"Snapshot saved! {len(data)} tracks loaded.")
-                                st.session_state['page'] = 0
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Error: {e}")
@@ -254,7 +302,6 @@ def main():
                         save_json(TRACKS_FILE, next_round_tracks)
                         save_json(VOTES_FILE, {}) # Clear votes for the next round
                         st.success(f"Advanced to next round with top {len(next_round_tracks)} tracks!")
-                        st.session_state['page'] = 0
                         st.rerun()
 
     # --- Main Logic ---
@@ -284,41 +331,16 @@ def main():
                 st.session_state['loaded_user'] = username
                 st.rerun()
 
-            # --- Pagination ---
-            total_tracks = len(snapshot_tracks)
-            total_pages = math.ceil(total_tracks / PAGE_SIZE)
-            
-            # Top Controls
-            c_info, c_save = st.columns([6, 2])
-            with c_info:
-                st.caption(f"Page {st.session_state['page'] + 1} of {total_pages} | Total Tracks: {total_tracks}")
-            with c_save:
-                if st.button("💾 Save Votes", type="primary", key="save_top"):
-                    all_votes[username] = list(st.session_state['votes'])
-                    save_json(VOTES_FILE, all_votes)
-                    st.toast("Votes saved!")
-            
-            # Render List
-            start_idx = st.session_state['page'] * PAGE_SIZE
-            end_idx = start_idx + PAGE_SIZE
-            current_batch = snapshot_tracks[start_idx:end_idx]
-            
-            for track in current_batch:
-                render_track_row(track)
+            # --- Auto-Save Logic ---
+            def auto_save():
+                all_votes[username] = list(st.session_state['votes'])
+                save_json(VOTES_FILE, all_votes)
 
-            # Bottom Pagination Controls
-            st.markdown("---")
-            col_prev, col_spacer, col_next = st.columns([1, 8, 1])
+            st.caption(f"Showing all {len(snapshot_tracks)} tracks. ✅ Votes are saved automatically.")
             
-            with col_prev:
-                if st.button("◀ Previous") and st.session_state['page'] > 0:
-                    st.session_state['page'] -= 1
-                    st.rerun()
-                    
-            with col_next:
-                if st.button("Next ▶") and st.session_state['page'] < total_pages - 1:
-                    st.session_state['page'] += 1
-                    st.rerun()
+            # Render List (No Pagination)
+            for track in snapshot_tracks:
+                render_track_row(track, on_vote_change=auto_save)
 
     # --- TAB 2: Results ---
     with tab_results:
